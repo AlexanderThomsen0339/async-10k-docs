@@ -49,7 +49,7 @@ Ulemper:
 
 Fordele:
 - Den bruger alle kerner.
-- RAM-forbruget afhænger af lofterne, ikke af antallet af dokumenter.
+- Hvor meget dokumenterne fylder i RAM, afhænger af lofterne, ikke af antallet af dokumenter.
 - Antallet af samtidige forbindelser er styret.
 
 Ulemper:
