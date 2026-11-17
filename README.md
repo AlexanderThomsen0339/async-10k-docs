@@ -1,89 +1,81 @@
-# 10.000 dokumenter uden at sprænge maskinen
+# Async dokumentbehandling
 
-Et minimalt eksempel i Python på, hvordan man behandler mange dokumenter hurtigt **og** med styr på hukommelsen:
+Et lille eksempel på, hvordan man behandler 10.000 dokumenter hurtigt uden at sprænge maskinen. Eksemplet bruger kun Pythons standardbibliotek: [asyncio](https://docs.python.org/3/library/asyncio.html) til I/O og [ProcessPoolExecutor](https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor) til CPU-arbejde.
 
-- **`asyncio` + `Semaphore`** til I/O (hente dokumenter)
-- **`ProcessPoolExecutor`** til CPU (parse dokumenter)
-- **og hvorfor de to skal holdes adskilt**
+Hvert dokument skal først hentes (I/O) og derefter parses (CPU). Hver fil er én måde at gøre det på:
 
-Kun standardbiblioteket. Ét script på ca. 70 linjer. Kræver Python 3.11+ (bruger `asyncio.TaskGroup`).
+- `naive.py` henter med asyncio og parser direkte i event loopet.
+- `unbounded.py` parser i en process pool, men har ingen lofter, så alle dokumenter hentes med det samme.
+- `bounded.py` holder I/O og CPU adskilt, med en semaphore til I/O, en process pool til parsing og et loft over, hvor mange dokumenter der ligger i hukommelsen.
 
-```bash
-python pipeline.py           # adskilt: I/O i event loop, CPU i process pool
-python pipeline.py naive     # parse direkte i event loopet
-python pipeline.py nolimit   # adskilt, men uden lofter
-```
+`docs.py` indeholder det, de tre filer deler: et simuleret `fetch` og et `parse`.
 
-## Idéen
+`bounded.py` er den, man skal bruge.
 
-Der er tre forskellige knappe ressourcer. Hver får sit eget værktøj og sit eget loft.
+## Hvorfor I/O og CPU skal holdes adskilt
 
-| Ressource | Værktøj | Loft | Hvorfor |
-|---|---|---|---|
-| Ventetid (netværk/disk) | `asyncio` + `Semaphore(200)` | Højt | Det koster næsten intet at vente. Hundredvis af kald kan være i gang på én tråd |
-| CPU (parsing) | `ProcessPoolExecutor` | Én proces pr. kerne | GIL'en gør, at én Python-proces kun bruger én kerne. Flere processer end kerner giver bare overhead |
-| RAM | `Semaphore(IN_FLIGHT)` | Lidt over hvad pipelinen kan nå | Backpressure: hentning må ikke løbe fra parsing |
+I/O er ventetid. Det koster næsten ingenting at vente, så asyncio kan have hundredvis af kald i gang på én tråd.
 
-```
-             in_flight (RAM-loft)
-  ┌───────────────────────────────────────────┐
-  │   io_sem (200)            process pool    │
-  │  ┌────────────┐          ┌─────────────┐  │
-  │  │ fetch()    │  bytes → │ parse()     │  │ → lille resultat
-  │  │ await I/O  │          │ én pr. kerne│  │
-  │  └────────────┘          └─────────────┘  │
-  └───────────────────────────────────────────┘
-```
+CPU er arbejde. Python kan kun køre én tråd ad gangen pr. proces (GIL), så parsing skal ud i separate processer, én pr. kerne.
 
-Hele mønsteret står i én funktion:
+Blandes de, går det galt:
+- Parser man i event loopet, står alle ventende netværkskald stille, mens der parses.
+- Henter man i process-poolen, bindes en hel proces til at vente. Med 8 kerner kan man så kun have 8 kald i gang.
+- Bruger man ét fælles loft, passer det aldrig til begge dele: 200 er for mange til CPU'en, og 8 er for få til netværket.
 
-```python
-async def handle(i, in_flight, io_sem, pool):
-    async with in_flight:                 # 1) backpressure: begræns RAM
-        async with io_sem:                # 2) begræns samtidige forbindelser
-            raw = await fetch(i)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(pool, parse, raw)  # 3) CPU i separat proces
-```
+## Fordele og ulemper
 
-## Hvorfor de skal holdes adskilt
+### Naiv (`naive.py`)
 
-**Parsing i event loopet** stopper loopet, mens der parses. Alle 200 ventende netværkskald står stille, og man ender med at lave cirka én ting ad gangen.
+Fordele:
+- Den er den enkleste.
+- Den bruger mindst RAM.
 
-**Hentning i process-poolen** binder en hel proces til at vente på netværket. Med 8 kerner kan man så kun have 8 kald i gang i stedet for 200.
+Ulemper:
+- Den bruger kun én kerne.
+- Mens der parses, står alle netværkskald stille.
 
-**Ét fælles loft** passer aldrig til begge dele. Sættes det til 200, får man 200 tunge parse-opgaver, der kæmper om 8 kerner. Sættes det til 8, venter man på netværket 8 kald ad gangen.
+### Uden lofter (`unbounded.py`)
 
-**Ingen lofter** betyder, at alle 10.000 dokumenter bliver hentet med det samme og ligger i RAM og venter på parseren.
+Fordele:
+- Den bruger alle kerner.
+- Den er stadig meget enkel.
+
+Ulemper:
+- Alle dokumenter hentes med det samme og ligger i RAM og venter på parseren. Ved 1 million dokumenter løber maskinen tør for hukommelse.
+- Den åbner lige så mange forbindelser, som der er dokumenter. Det kan en rigtig server ikke holde til.
+
+### Med lofter (`bounded.py`)
+
+Fordele:
+- Den bruger alle kerner.
+- RAM-forbruget afhænger af lofterne, ikke af antallet af dokumenter.
+- Antallet af samtidige forbindelser er styret.
+
+Ulemper:
+- Der er tre tal, der skal justeres: `IO_LIMIT`, `CPU_WORKERS` og `IN_FLIGHT`.
+- Hvert dokument pickles og sendes til en anden proces. Hvis parsing er meget let, kan det koste mere end det sparer.
 
 ## Målinger
 
-10.000 dokumenter på ca. 54 KB, 50 ms simuleret I/O pr. dokument, 2 kerner:
+10.000 dokumenter på ca. 54 KB, 50 ms simuleret netværk og ca. 2 ms parsing pr. dokument, på en maskine med 2 kerner:
 
-| Variant | Tid | Docs/s | Peak RAM (hovedproces) |
+| Fil | Tid | Docs/s | Peak RAM |
 |---|---|---|---|
-| `naive` – parsing i event loopet | 8,3 s | 1.199 | 38 MB |
-| **`adskilt` – med lofter** | **6,4 s** | **1.560** | **49 MB** |
-| `nolimit` – adskilt uden lofter | 7,3 s | 1.366 | 578 MB |
+| `naive.py` | 18,0 s | 555 | 36 MB |
+| `unbounded.py` | 12,9 s | 777 | 576 MB |
+| `bounded.py` | 13,7 s | 729 | 47 MB |
 
-- Med kun 2 kerner er tidsgevinsten beskeden. Den vokser nogenlunde med antallet af kerner.
-- Den store forskel er RAM. Med lofter er hukommelsen bundet af `IN_FLIGHT`, ikke af antallet af dokumenter, så den holder sig også nede ved 1 million dokumenter.
-- `naive` bruger lidt mindre RAM, fordi den aldrig når at have mange dokumenter liggende. Den er bare langsom.
+Med flere kerner bliver `unbounded.py` og `bounded.py` hurtigere, men `naive.py` gør ikke. `bounded.py` er en anelse langsommere end `unbounded.py`, til gengæld bruger den 12 gange mindre RAM.
 
-## Detaljer der betyder noget for performance
+## Kør
 
-- **Returnér noget lille fra `parse`.** Både input og output pickles og sendes mellem processerne.
-- **`parse` skal være en top-level funktion**, ikke en lambda eller closure. Ellers kan den ikke pickles.
-- **Opret poolen én gang og genbrug den.** Det tager ca. 50 ms at starte en ny proces.
-- **Tasks der venter på en semaphore koster næsten intet.** 10.000 tasks er fint. Ved millioner af dokumenter kan man skifte til et fast antal workers, der læser fra en `asyncio.Queue`.
+Kræver Python 3.9 eller nyere.
 
-## Brug det på rigtige data
-
-Udskift de to funktioner:
-
-```python
-async def fetch(i):       # fx httpx.AsyncClient().get(...) eller aiofiles
-def parse(raw: bytes):    # fx PDF-/HTML-/JSON-parsing
+```
+python naive.py
+python unbounded.py
+python bounded.py
 ```
 
-Justér så de tre konstanter øverst i `pipeline.py`: `IO_LIMIT`, `CPU_WORKERS` og `IN_FLIGHT`.
+Peak RAM vises kun på Linux.
